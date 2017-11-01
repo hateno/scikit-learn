@@ -18,9 +18,19 @@ from ..externals.joblib import delayed
 from ..isotonic import IsotonicRegression
 
 
+def _set_fixed_points(X, fixed_points, fixed_ids):
+    for idx, fixed_id in enumerate(fixed_ids):
+        X[fixed_id] = fixed_points[idx]
+    return X
+
 def _smacof_single(dissimilarities, metric=True, n_components=2, init=None,
-                   max_iter=300, verbose=0, eps=1e-3, random_state=None, fixed_points=[], fdissim=[]):
+                   max_iter=300, verbose=0, eps=1e-3, random_state=None, fixed_points=None, fdissim=None, fixed_ids=None):
     """Computes multidimensional scaling using SMACOF algorithm
+
+    If fdissim is None, compute using fixed points replacement in SMACOF
+        dissimilarities will contain all dissimilarities including the fixed points (n = m + f)
+    If fdissim is not None, compute using modified stress value and original SMACOF over moving points
+        dissimilarities will only contain all dissimilarities between the moving points and fixed points (m = n - f)
 
     References
     ----------
@@ -28,8 +38,14 @@ def _smacof_single(dissimilarities, metric=True, n_components=2, init=None,
     Informatica (2007)
     """
     dissimilarities = check_symmetric(dissimilarities, raise_exception=True)
-
     n_samples = dissimilarities.shape[0]
+    f_samples = fixed_points.shape[0]
+
+    # assert parameters are passed in correctly for given algorithm
+    if (fdissim is not None and n_samples != fdissim.shape[0]) or \
+            (fixed_ids is None and fdissim is None):
+        raise Exception
+
     random_state = check_random_state(random_state)
 
     sim_flat = ((1 - np.tri(n_samples)) * dissimilarities).ravel()
@@ -46,6 +62,11 @@ def _smacof_single(dissimilarities, metric=True, n_components=2, init=None,
                              (n_samples, n_components))
         X = init
 
+    # set fixed points in X
+    if fixed_ids is not None:
+        X = _set_fixed_points(X, fixed_points, fixed_ids)
+
+    # continue with SMACOF
     old_stress = None
     ir = IsotonicRegression()
     for it in range(max_iter):
@@ -69,9 +90,11 @@ def _smacof_single(dissimilarities, metric=True, n_components=2, init=None,
                                    (disparities ** 2).sum())
 
         # Compute stress
-        stress_interpoint = ((dis.ravel() - disparities.ravel()) ** 2).sum() / 2
-        stress_fixed = ((fdis.ravel() - fdissim.ravel()) ** 2).sum() / 2
-        stress = stress_interpoint + stress_fixed
+        stress = ((dis.ravel() - disparities.ravel()) ** 2).sum() / 2
+        if fdissim is not None:
+            stress_interpoint = ((dis.ravel() - disparities.ravel()) ** 2).sum() / 2
+            stress_fixed = ((fdis.ravel() - fdissim.ravel()) ** 2).sum() / 2
+            stress = stress_interpoint + stress_fixed
 
         # Update X using the Guttman transform
         dis[dis == 0] = 1e-5
@@ -79,6 +102,11 @@ def _smacof_single(dissimilarities, metric=True, n_components=2, init=None,
         B = - ratio
         B[np.arange(len(B)), np.arange(len(B))] += ratio.sum(axis=1)
         X = 1. / n_samples * np.dot(B, X)
+
+        # reset fixed points in X
+        if fixed_ids is not None:
+            X = _set_fixed_points(X, fixed_points, fixed_ids)
+
 
         dis = np.sqrt((X ** 2).sum(axis=1)).sum()
         if verbose >= 2:
@@ -93,10 +121,9 @@ def _smacof_single(dissimilarities, metric=True, n_components=2, init=None,
 
     return X, stress, it + 1
 
-
 def smacof(dissimilarities, metric=True, n_components=2, init=None, n_init=8,
            n_jobs=1, max_iter=300, verbose=0, eps=1e-3, random_state=None,
-           return_n_iter=False, fixed_points=[], fdissim=[]):
+           return_n_iter=False, fixed_points=None, fdissim=None, fixed_ids=None):
     """Computes multidimensional scaling using the SMACOF algorithm.
 
     The SMACOF (Scaling by MAjorizing a COmplicated Function) algorithm is a
@@ -138,7 +165,7 @@ def smacof(dissimilarities, metric=True, n_components=2, init=None, n_init=8,
                 n_components=n_components, init=init,
                 max_iter=max_iter, verbose=verbose,
                 eps=eps, random_state=random_state,
-                fixed_points=fixed_points, fdissim=fdissim)
+                fixed_points=fixed_points, fdissim=fdissim, fixed_ids=fixed_ids)
             if best_stress is None or stress < best_stress:
                 best_stress = stress
                 best_pos = pos.copy()
@@ -149,7 +176,7 @@ def smacof(dissimilarities, metric=True, n_components=2, init=None, n_init=8,
             delayed(_smacof_single)(
                 dissimilarities, metric=metric, n_components=n_components,
                 init=init, max_iter=max_iter, verbose=verbose, eps=eps,
-                random_state=seed, fixed_points=fixed_points, fdissim=fdissim)
+                random_state=seed, fixed_points=fixed_points, fdissim=fdissim, fixed_ids=fixed_ids)
             for seed in seeds)
         positions, stress, n_iters = zip(*results)
         best = np.argmin(stress)
@@ -174,10 +201,13 @@ class RMDS(BaseEstimator):
 
     fdissim : ndarray, shape (n_sample, n_basis)
         Precomputed actual distance of samples from basis
+
+    fixed_ids : ndarray, shape (n_basis, 1)
+        Index values of the fixed points to re-insert the fixed points in the correct place
     """
     def __init__(self, n_components=2, metric=True, n_init=4,
                  max_iter=300, verbose=0, eps=1e-3, n_jobs=1,
-                 random_state=None, dissimilarity="euclidean", fixed_points=None, fdissim=None):
+                 random_state=None, dissimilarity="euclidean", fixed_points=None, fdissim=None, fixed_ids=None):
         self.n_components = n_components
         self.dissimilarity = dissimilarity
         self.metric = metric
@@ -189,6 +219,7 @@ class RMDS(BaseEstimator):
         self.random_state = random_state
         self.fixed_points = fixed_points
         self.fdissim = fdissim
+        self.fixed_ids = fixed_ids
 
     @property
     def _pairwise(self):
@@ -225,6 +256,6 @@ class RMDS(BaseEstimator):
             n_components=self.n_components, init=init, n_init=self.n_init,
             n_jobs=self.n_jobs, max_iter=self.max_iter, verbose=self.verbose,
             eps=self.eps, random_state=self.random_state, return_n_iter=True,
-            fixed_points=self.fixed_points, fdissim=self.fdissim)
+            fixed_points=self.fixed_points, fdissim=self.fdissim, fixed_ids=self.fixed_ids)
 
         return self.embedding_
